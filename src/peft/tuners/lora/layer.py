@@ -2038,6 +2038,15 @@ class ParamWrapper(nn.Module, LoraLayer):
         # For ParamWrapper, we don't derive the in_features and out_features based on the base layer type, but directly
         # from the targeted parameter.
         param = self.get_param()
+        
+        # Params4bit uses compressed 2D storage; use _original_shape set by quantizer when present
+        if get_bnb_param_type(param) == "4bit":
+            shape = getattr(param, "_original_shape", None)
+            if shape is not None and len(shape) == 3:
+                num_experts, in_features, out_features = shape
+                self.num_experts = num_experts
+                return in_features, out_features
+        
         if param.ndim == 3:
             num_experts, in_features, out_features = param.shape
         else:
