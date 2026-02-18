@@ -27,6 +27,7 @@ from transformers.pytorch_utils import Conv1D
 from peft.tuners._buffer_dict import BufferDict
 from peft.tuners.tuners_utils import BaseTunerLayer, _get_in_out_features, check_adapters_to_merge
 from peft.utils.integrations import (
+    dequantize_bnb_weight,
     dequantize_module_weight,
     gather_params_ctx,
     get_bnb_param_type,
@@ -1967,13 +1968,19 @@ class MultiheadAttention(nn.Module, LoraLayer):
 class _LoraParameterProxy(nn.Module):
     """This proxies an `nn.Parameter` that is targeted with LoRA.
     Intended to be used in conjunction with `nn.utils.parametrize`, see `ParamWrapper`.
+    When the base parameter is quantized (e.g. BnB 4bit/8bit), W passed to forward() may be
+    in compressed form (wrong shape/dtype). Pass get_base_weight so the proxy dequantizes
+    before adding the delta.
     """
 
-    def __init__(self, delta_weight):
+    def __init__(self, delta_weight, get_base_weight=None):
         super().__init__()
         self.delta_weight = delta_weight
+        self.get_base_weight = get_base_weight
 
     def forward(self, W):
+        if self.get_base_weight is not None:
+            W = self.get_base_weight()
         return W + self.delta_weight
 
 
@@ -2038,7 +2045,6 @@ class ParamWrapper(nn.Module, LoraLayer):
         # For ParamWrapper, we don't derive the in_features and out_features based on the base layer type, but directly
         # from the targeted parameter.
         param = self.get_param()
-        
         # Params4bit uses compressed 2D storage; use _original_shape set by quantizer when present
         if get_bnb_param_type(param) == "4bit":
             shape = getattr(param, "_original_shape", None)
@@ -2046,7 +2052,6 @@ class ParamWrapper(nn.Module, LoraLayer):
                 num_experts, in_features, out_features = shape
                 self.num_experts = num_experts
                 return in_features, out_features
-        
         if param.ndim == 3:
             num_experts, in_features, out_features = param.shape
         else:
@@ -2154,8 +2159,9 @@ class ParamWrapper(nn.Module, LoraLayer):
             if adapter_name not in adapter_layer:
                 continue
             if any(p.device == meta for p in adapter_layer.parameters()):
-                continue
-
+                continue 
+            
+            # We have quantized weights - so this is false - Fix this
             if param.dtype.is_floating_point or param.dtype.is_complex:
                 adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device, dtype=param.dtype)
             else:
@@ -2180,7 +2186,11 @@ class ParamWrapper(nn.Module, LoraLayer):
 
         base_layer = self.get_base_layer()
         param = self.get_param()
-        delta_weight = delta_weight.to(param.device, param.dtype)
+        # Only cast to param.dtype when it's float/complex; quantized (e.g. uint8) would corrupt the delta
+        if param.dtype.is_floating_point or param.dtype.is_complex:
+            delta_weight = delta_weight.to(param.device, param.dtype)
+        else:
+            delta_weight = delta_weight.to(param.device)
         return delta_weight
 
     @contextmanager
@@ -2200,9 +2210,23 @@ class ParamWrapper(nn.Module, LoraLayer):
                 delta_weight = delta_weight + self.get_delta_weight(active_adapter)
 
         base_layer = self.get_base_layer()
-        requires_grad_before = self.get_param().requires_grad
+        param = self.get_param()
+        requires_grad_before = param.requires_grad
+        # When base param is quantized (BnB 4bit/8bit), W passed to the proxy is compressed (wrong shape/dtype).
+        # Pass a callable that dequantizes the original param so we do W_dequant + delta.
+        is_quantized = bool(get_bnb_param_type(param))
+        if is_quantized:
+            state = getattr(param, "quant_state", None) or getattr(base_layer, "state", None)
+
+            def get_base_weight():
+                return dequantize_bnb_weight(param, state=state)
+
+            proxy = _LoraParameterProxy(delta_weight, get_base_weight=get_base_weight)
+        else:
+            proxy = _LoraParameterProxy(delta_weight)
+        # With quantized params, proxy returns float (dequantized + delta); dtype/shape differ from original → need unsafe
         nn.utils.parametrize.register_parametrization(
-            base_layer, self.parameter_name, _LoraParameterProxy(delta_weight)
+            base_layer, self.parameter_name, proxy, unsafe=is_quantized
         )
         # set requires_grad, as it defaults to False
         base_layer.parametrizations[self.parameter_name].original.requires_grad_(requires_grad_before)
